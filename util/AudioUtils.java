@@ -1,0 +1,413 @@
+/*
+ * ------------------------------------------------------------------------
+ *
+ *  Copyright by KNIME GmbH, Konstanz, Germany
+ *  Website: http://www.knime.org; Email: contact@knime.org
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License, Version 3, as
+ *  published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, see <http://www.gnu.org/licenses>.
+ *
+ *  Additional permission under GNU GPL version 3 section 7:
+ *
+ *  KNIME interoperates with ECLIPSE solely via ECLIPSE's plug-in APIs.
+ *  Hence, KNIME and ECLIPSE are both independent programs and are not
+ *  derived from each other. Should, however, the interpretation of the
+ *  GNU GPL Version 3 ("License") under any applicable laws result in
+ *  KNIME and ECLIPSE being a combined program, KNIME GMBH herewith grants
+ *  you the additional permission to use and propagate KNIME together with
+ *  ECLIPSE with only the license terms in place for ECLIPSE applying to
+ *  ECLIPSE and the GNU GPL Version 3 applying for KNIME, provided the
+ *  license terms of ECLIPSE themselves allow for the respective use and
+ *  propagation of ECLIPSE together with KNIME.
+ *
+ *  Additional permission relating to nodes for KNIME that extend the Node
+ *  Extension (and in particular that are based on subclasses of NodeModel,
+ *  NodeDialog, and NodeView) and that only interoperate with KNIME through
+ *  standard APIs ("Nodes"):
+ *  Nodes are deemed to be separate and independent programs and to not be
+ *  covered works.  Notwithstanding anything to the contrary in the
+ *  License, the License does not apply to Nodes, you are not required to
+ *  license Nodes under the License, and you are granted a license to
+ *  prepare and propagate Nodes, in each case even if such Nodes are
+ *  propagated with or for interoperation with KNIME.  The owner of a Node
+ *  may freely choose the license terms applicable to such Node, including
+ *  when such Node is propagated with or for interoperation with KNIME.
+ * ---------------------------------------------------------------------
+ *
+ * History
+ *   Mar 14, 2016 (budiyanto): created
+ */
+package org.knime.base.node.audio.util;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.UnsupportedAudioFileException;
+import javax.swing.JOptionPane;
+
+import org.knime.base.node.audio.data.KNAudio;
+import org.knime.base.node.audio.data.feature.FeatureType;
+import org.knime.base.node.audio.data.feature.aggregator.Mean;
+import org.knime.base.node.audio.data.feature.extractor.FeatureExtractor;
+import org.knime.core.node.NodeLogger;
+
+import jAudioFeatureExtractor.jAudioTools.AudioMethods;
+import jAudioFeatureExtractor.jAudioTools.DSPMethods;
+
+/**
+ * The code is mainly based on
+ * https://github.com/Radiodef/WaveformDemo/blob/master/waveformdemo/WaveformDemo.java
+ *
+ * Original author: David Staver, 2013
+ *
+ * This work is licensed under the Creative Commons
+ * Attribution-ShareAlike 3.0 Unported License.
+ * To view a copy of this license, visit
+ * http://creativecommons.org/licenses/by-sa/3.0/
+ *
+ * @author Budi Yanto, KNIME.com
+ */
+public final class AudioUtils {
+
+    /** Prevent the creation of a new instance. */
+    private AudioUtils() {}
+
+    private static final NodeLogger LOGGER = NodeLogger.getLogger(AudioUtils.class);
+
+    /**
+     * Default buffer sample size
+     */
+    public static final int DEF_BUFFER_SAMPLE_SZ = 1024;
+
+    /** Default window size **/
+    private static int DEFAULT_WINDOW_SIZE = 512;
+
+    /**
+     * Normalizes bytes from bits.
+     *
+     * Some formats allow for bit depths in non-multiples of 8.
+     * they will, however, typically pad so the samples are stored
+     * that way. AIFF is one of these formats.
+     *
+     * so the expression:
+     *
+     *  bitsPerSample + 7 >> 3
+     *
+     * computes a division of 8 rounding up (for positive numbers).
+     *
+     * this is basically equivalent to:
+     *
+     * (int)Math.ceil(bitsPerSample / 8.0)
+     *
+     * @param bitsPerSample bits to normalize
+     * @return the normalized bytes
+     */
+    public static int normalizeBytesFromBits(final int bitsPerSample) {
+        return bitsPerSample + 7 >> 3;
+    }
+
+    public static int normalizeBitDepthFromBits(final int bitsPerSample){
+        return normalizeBytesFromBits(bitsPerSample) * 8;
+    }
+
+    /**
+     *
+     * @param bytes
+     * @param transfer
+     * @param samples
+     * @param bvalid
+     * @param fmt
+     * @return samples
+     */
+    public static float[] unpack(final byte[] bytes, final long[] transfer,
+            final float[] samples, final int bvalid, final AudioFormat fmt) {
+        if(fmt.getEncoding() != AudioFormat.Encoding.PCM_SIGNED
+                && fmt.getEncoding() != AudioFormat.Encoding.PCM_UNSIGNED) {
+            return samples;
+        }
+
+        final int bitsPerSample = fmt.getSampleSizeInBits();
+        final int normalBytes = normalizeBytesFromBits(bitsPerSample);
+
+        /*
+         * not the most DRY way to do this but it's a bit more efficient.
+         * otherwise there would either have to be 4 separate methods for
+         * each combination of endianness/signedness or do it all in one
+         * loop and check the format for each sample.
+         *
+         * a helper array (transfer) allows the logic to be split up
+         * but without being too repetetive.
+         *
+         * here there are two loops converting bytes to raw long samples.
+         * integral primitives in Java get sign extended when they are
+         * promoted to a larger type so the & 0xffL mask keeps them intact.
+         *
+         */
+
+        if(fmt.isBigEndian()) {
+            for(int i = 0, k = 0, b; i < bvalid; i += normalBytes, k++) {
+                transfer[k] = 0L;
+
+                int least = i + normalBytes - 1;
+                for(b = 0; b < normalBytes; b++) {
+                    transfer[k] |= (bytes[least - b] & 0xffL) << (8 * b);
+                }
+            }
+        } else {
+            for(int i = 0, k = 0, b; i < bvalid; i += normalBytes, k++) {
+                transfer[k] = 0L;
+
+                for(b = 0; b < normalBytes; b++) {
+                    transfer[k] |= (bytes[i + b] & 0xffL) << (8 * b);
+                }
+            }
+        }
+
+        final long fullScale = (long)Math.pow(2.0, bitsPerSample - 1);
+
+        /*
+         * the OR is not quite enough to convert,
+         * the signage needs to be corrected.
+         *
+         */
+
+        if(fmt.getEncoding() == AudioFormat.Encoding.PCM_SIGNED) {
+
+            /*
+             * if the samples were signed, they must be
+             * extended to the 64-bit long.
+             *
+             * the arithmetic right shift in Java  will fill
+             * the left bits with 1's if the MSB is set.
+             *
+             * so sign extend by first shifting left so that
+             * if the sample is supposed to be negative,
+             * it will shift the sign bit in to the 64-bit MSB
+             * then shift back and fill with 1's.
+             *
+             * as an example, imagining these were 4-bit samples originally
+             * and the destination is 8-bit, if we have a hypothetical
+             * sample -5 that ought to be negative, the left shift looks
+             * like this:
+             *
+             *     00001011
+             *  <<  (8 - 4)
+             *  ===========
+             *     10110000
+             *
+             * (except the destination is 64-bit and the original
+             * bit depth from the file could be anything.)
+             *
+             * and the right shift now fills with 1's:
+             *
+             *     10110000
+             *  >>  (8 - 4)
+             *  ===========
+             *     11111011
+             *
+             */
+
+            final long signShift = 64L - bitsPerSample;
+
+            for(int i = 0; i < transfer.length; i++) {
+                transfer[i] = (
+                        (transfer[i] << signShift) >> signShift
+                        );
+            }
+        } else {
+            /*
+             * unsigned samples are easier since they
+             * will be read correctly in to the long.
+             *
+             * so just sign them:
+             * subtract 2^(bits - 1) so the center is 0.
+             *
+             */
+
+            for(int i = 0; i < transfer.length; i++) {
+                transfer[i] -= fullScale;
+            }
+        }
+        /* finally normalize to range of -1.0f to 1.0f */
+
+        for(int i = 0; i < transfer.length; i++) {
+            samples[i] = (float)transfer[i] / (float)fullScale;
+        }
+
+        return samples;
+    }
+
+    /**
+     * most basic window function
+     * multiply the window against a sine curve, tapers ends
+     *
+     * nested loops here show a paradigm for processing multi-channel formats
+     * the interleaved samples can be processed "in place"
+     * inner loop processes individual channels using an offset
+     *
+     * @param samples
+     * @param svalid
+     * @param fmt
+     * @return samples
+     */
+    public static float[] window(final float[] samples, final int svalid,
+            final AudioFormat fmt) {
+
+        int channels = fmt.getChannels();
+        int slen = svalid / channels;
+
+        for(int ch = 0, k, i; ch < channels; ch++) {
+            for(i = ch, k = 0; i < svalid; i += channels) {
+                samples[i] *= Math.sin(Math.PI * k++ / (slen - 1));
+            }
+        }
+
+        return samples;
+    }
+
+    /**
+     * Shows error message in a dialog pane
+     * @param t
+     */
+    public static void showError(final Throwable t) {
+        JOptionPane.showMessageDialog(null,
+            "Exception <" + t.getClass().getName() + ">" + " with message '" + t.getMessage() + "'.",
+            "There was an error", JOptionPane.WARNING_MESSAGE);
+    }
+
+    public static double[][] getSamples(final KNAudio audio) throws UnsupportedAudioFileException, IOException{
+        final AudioInputStream originalStream = AudioSystem.getAudioInputStream(
+            new File(audio.getFilePath()));
+        AudioFormat format = originalStream.getFormat();
+        final int bitDepth = normalizeBitDepthFromBits(format.getSampleSizeInBits());
+
+        // If the audio is not PCM signed big endian, then convert it to PCM
+        // signed. This is particularly necessary when dealing with MP3s
+        AudioInputStream newStream = originalStream;
+        if(format.getEncoding() != AudioFormat.Encoding.PCM_SIGNED ||
+                !format.isBigEndian()){
+            format = new AudioFormat(AudioFormat.Encoding.PCM_SIGNED,
+                format.getSampleRate(), bitDepth, format.getChannels(),
+                format.getChannels() * (bitDepth / 8), format.getFrameRate(), true);
+            newStream = AudioSystem.getAudioInputStream(format, originalStream);
+        }
+
+        double[][] channelSamples = null;
+        try{
+            channelSamples = AudioMethods.extractSampleValues(newStream);
+        } catch(Exception ex){
+            LOGGER.error(ex.getMessage());
+        }
+
+
+        originalStream.close();
+
+
+        if(newStream != null){
+            newStream.close();
+        }
+
+        if(channelSamples == null){
+            return null;
+        }
+        return channelSamples;
+//        return DSPMethods.getSamplesMixedDownIntoOneChannel(channelSamples);
+
+    }
+
+    public static double[] getSamplesMixedDownIntoOneChannel(
+            final KNAudio audio) throws UnsupportedAudioFileException, IOException {
+        final double[][] samples = getSamples(audio);
+        return DSPMethods.getSamplesMixedDownIntoOneChannel(samples);
+    }
+
+    public static Map<FeatureType, double[]> extractFeatures(final double[] samples,
+            final double sampleRate, final FeatureExtractor[] extractors) throws Exception{
+
+//        int[] windowIndices = calculateWindowStartIndices(samples, DEFAULT_WINDOW_SIZE);
+
+        Map<FeatureType, double[][]> featuresPerWindowMap = new HashMap<FeatureType, double[][]>();
+
+        List<double[]> sampleInWindows = cutSampleIntoWindows(samples, DEFAULT_WINDOW_SIZE);
+
+        for(FeatureExtractor extractor : extractors){
+            final double[][] featuresPerWindow = new double[sampleInWindows.size()][];
+            for(int windowIdx = 0; windowIdx < sampleInWindows.size(); windowIdx++){
+                double[][] additionalFeatures = null;
+                if(extractor.getType().hasDependencies()){
+                    FeatureType[] dependencies = extractor.getType().getDependencies();
+                    additionalFeatures = new double[dependencies.length][];
+                    for(int depIdx = 0; depIdx < dependencies.length; depIdx++){
+                        final FeatureType dep = dependencies[depIdx];
+                        // The dependency has been extracted
+                        if(featuresPerWindowMap.containsKey(dep)){
+                            additionalFeatures[depIdx] = featuresPerWindowMap.get(
+                                dependencies[depIdx])[windowIdx];
+                        } else{ // The dependency hasn't been extracted
+                            FeatureExtractor depExtractor = FeatureExtractor.
+                                    getFeatureExtractor(dep);
+                            additionalFeatures[depIdx] = depExtractor.
+                                    extractFeature(sampleInWindows.get(windowIdx),
+                                        sampleRate, null);
+                        }
+
+                    }
+                }
+
+                featuresPerWindow[windowIdx] = extractor.extractFeature(
+                    sampleInWindows.get(windowIdx), sampleRate, additionalFeatures);
+            }
+            featuresPerWindowMap.put(extractor.getType(), featuresPerWindow);
+        }
+
+        Map<FeatureType, double[]> result = new HashMap<FeatureType, double[]>();
+        for(Entry<FeatureType, double[][]> entry : featuresPerWindowMap.entrySet()){
+            final double[] mean = Mean.aggregate(entry.getValue());
+            result.put(entry.getKey(), mean);
+        }
+
+        return result;
+    }
+
+    private static List<double[]> cutSampleIntoWindows(final double[] samples, final int windowSize){
+        final List<double[]> result = new ArrayList<double[]>();
+        for(int start = 0; start < samples.length; start += windowSize){
+            // Find the samples in the window and zero-pad if necessary
+            final double[] window = new double[windowSize];
+            final int end = start + windowSize - 1;
+            if(end < samples.length){
+                for(int sampleIdx = start; sampleIdx <= end; sampleIdx++){
+                    window[sampleIdx - start] = samples[sampleIdx];
+                }
+            } else{
+                for(int sampleIdx = start; sampleIdx <= end; sampleIdx++){
+                    if(sampleIdx < samples.length){
+                        window[sampleIdx - start] = samples[sampleIdx];
+                    } else{
+                        window[sampleIdx - start] = 0.0;
+                    }
+                }
+            }
+            result.add(window);
+        }
+        return result;
+    }
+
+}
